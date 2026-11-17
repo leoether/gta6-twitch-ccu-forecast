@@ -1,41 +1,59 @@
 // GTA VI launch-day Twitch viewer forecast — make.fun gta6-twitch-ccu-forecast-01.
 //
-// The program reads one case per run (/input/<id>.in, or $MAKEFUN_INPUT_DIR) and
-// writes /output/<id>.out (or $MAKEFUN_OUTPUT_DIR): for each of hours 2..24 of
-// the release day, five quantiles of Twitch's concurrent viewers in the
-// "Grand Theft Auto VI" category, scored by pinball loss on the log scale.
+// v3: LOESS forecaster. Reads one case per run (/input/<id>.in, or
+// $MAKEFUN_INPUT_DIR) and writes /output/<id>.out (or $MAKEFUN_OUTPUT_DIR):
+// for each of hours 2..24 of the release day, five quantiles of Twitch's
+// concurrent viewers in the "Grand Theft Auto VI" category, scored by
+// pinball loss on the log scale.
 //
 // Method (no network, no model, deterministic — pure functions of the case):
 //
-//   1. Anchor on the case's own hour-1 print p1. Every later hour is forecast
-//      as a ratio to p1, so the level follows the launch's actual opening hour
-//      while the shape comes from history.
+//   1. Anchor on the case's own hour-1 print p1. Every later hour is
+//      forecast as a ratio to p1, so the level follows the launch's actual
+//      opening hour while the shape comes from history.
 //   2. Shape from the case's comparables: past big game launches' hourly
-//      Twitch curves, normalised per launch as log(v_h / v_1). Two pools:
+//      Twitch curves, normalised per launch as log(v_h / v_1). The key
+//      structure v2 missed: how much a launch rises after hour 1 depends
+//      strongly on how big hour 1 already is. Small hour-1 launches
+//      (pre-launch trickle at 00:00Z, or small regional openings) rise
+//      10-2000x; the biggest midnight-local openings (Elden Ring, Cyberpunk
+//      2077) barely rise at all (peak 1.0-1.3x). A plain median over the
+//      pool mixes those regimes and lands in between — wrong for both.
+//      So per hour we fit log(v_h / v_1) against log(v_1) with a local
+//      linear (LOESS) fit, Gaussian kernel bandwidth 2.5 in log-viewers,
+//      evaluated at the target's own log(p1). Two pools, as in v2:
 //        A — rolling midnight-local unlocks (the unlock text says
 //            "midnight local", not early-access-contaminated, not weak tier).
 //            This is GTA VI's own regime: it unlocks at local midnight,
 //            country by country, so hour 1 is already a real opening hour.
 //        B — every comparable with a usable hour 1.
-//      Pool A is the honest analogue; pool B's median curve rises more
-//      steeply (it holds simultaneous-global launches whose hour 1 is still
-//      pre-launch trickle), which hedges the steep-rise launches that pool A
-//      alone under-forecasts. The forecast median is 0.75 * A + 0.25 * B.
-//   3. Spread from the same pools: per hour, the log-ratio interquartile
-//      range / 1.349 as a lognormal sigma, blended 0.75/0.25 like the median,
-//      then a 3-hour running median smooth over both curves. Quantiles are
+//      Pool A is the honest analogue; pool B hedges the steep-rise launches
+//      that pool A alone under-forecasts. Median and spread blend
+//      0.75 * A + 0.25 * B, then a 3-hour running median smooth.
+//   3. Spread from the same fit: the weighted interquartile range of the
+//      LOESS residuals (actual log-ratio minus the fit at that launch's own
+//      log(v_1)), weights from the same kernel at log(p1), / 1.349 as a
+//      lognormal sigma, scaled by 0.8 (practice calibration: the raw IQR
+//      spread is slightly too wide once the median is right). Quantiles are
 //      p1 * exp(median_h + z_tau * sigma_h) with the standard normal z at
-//      0.05/0.25/0.5/0.75/0.95. The spread is honest about how much launches
-//      disagree: about 90% of scored hours should land inside q05..q95.
-//   4. If a pool has no data for an hour, the other pool fills in; if neither
-//      does, the hour falls back to persistence (the house baseline's widening
-//      spread), so the output is always a valid 23-row forecast.
+//      0.05/0.25/0.5/0.75/0.95.
+//   4. The fitted median log-ratio is clamped to [-1.5, 2.5]: GTA VI's
+//      hour 1 may exceed every comparable's, and a local-linear fit must
+//      not extrapolate the (negative) size slope into an absurd collapse.
+//      If a pool has no data for an hour, the other pool fills in; if
+//      neither does, the hour falls back to persistence (the house
+//      baseline's widening spread), so the output is always valid.
 //
 // Local validation (practice answers re-fetched from SullyGnome's "Average
-// viewers" series, the same source the house used; see scratch/answers.json):
-//   house baseline practice loss ~0.387; this entry ~0.251 (p00 0.460,
-//   p01 0.134, p02 0.191, p03 0.220). Leave-one-out over the comparables'
-//   own midnight-local launches: ~0.311 vs ~0.330 unblended.
+// viewers" series, the same source the house used; see v1 scratch/
+// answers.json — Wolverine, RDR2, GoW Ragnarok, Spider-Man 2):
+//   house baseline practice loss ~0.387; v2 (pool medians) ~0.251;
+//   v3 (this entry) ~0.146 (p00 0.155, p01 0.114, p02 0.110, p03 0.205).
+//   Big console launches like the target (p01/p02) score ~0.11.
+//   Tried and rejected on the same practice set: plain v1-kernel medians
+//   (0.206), empirical quantiles (0.295), LOO per-hour bias correction
+//   (worse), asymmetric sigmas (worse), history-diurnal blending (worse),
+//   console-only weighting (worse), quadratic LOESS (see scratch).
 //
 // Run locally: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
@@ -51,6 +69,13 @@ const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z: Record<number, number> = { 0.05: -1.645, 0.25: -0.674, 0.5: 0, 0.75: 0.674, 0.95: 1.645 };
 /** Weight of the midnight-local pool in the median/spread blend. */
 const LOCAL_WEIGHT = 0.75;
+/** LOESS kernel bandwidth, in log-viewer units (log(v_1) distance). */
+const LOESS_BW = 2.5;
+/** Calibration scale on the IQR-based sigma (practice-tuned). */
+const SIGMA_SCALE = 0.8;
+/** Clamp on the fitted median log-ratio (guards far extrapolation). */
+const MED_MIN = -1.5;
+const MED_MAX = 2.5;
 /** Fallback log-spread per sqrt-hour when no comparable informs an hour. */
 const FALLBACK_SIGMA = 0.15;
 
@@ -83,6 +108,19 @@ function quantile(sorted: number[], q: number): number {
   const lo = Math.floor(pos);
   const hi = Math.min(n - 1, lo + 1);
   return sorted[lo] * (1 - (pos - lo)) + sorted[hi] * (pos - lo);
+}
+
+/** Weighted quantile (weights need not sum to 1). */
+function weightedQuantile(values: number[], weights: number[], q: number): number {
+  const order = values.map((v, i) => [v, weights[i]] as const).sort((a, b) => a[0] - b[0]);
+  const total = weights.reduce((a, b) => a + b, 0);
+  if (total <= 0) return order.length > 0 ? order[0][0] : 0;
+  let acc = 0;
+  for (const [v, w] of order) {
+    acc += w;
+    if (acc >= total * q) return v;
+  }
+  return order[order.length - 1][0];
 }
 
 /** 3-point running median over hours 2..24 (edges use the available neighbours). */
@@ -124,21 +162,62 @@ function isMidnightLocal(comp: Comparable): boolean {
   return text.includes('midnight local');
 }
 
-/** Per-hour median and IQR-based sigma of log(v_h / v_1) over a pool of series. */
-function poolCurves(pool: Map<number, number>[]): { med: Map<number, number>; sd: Map<number, number> } {
+/**
+ * Local-linear (LOESS) fit of y on x with a Gaussian kernel of bandwidth
+ * `bw`, evaluated at x0. Falls back to the weighted mean when the local
+ * slope is unidentified (near-zero spread in x).
+ */
+function loessPredict(xs: number[], ys: number[], x0: number, bw: number): number {
+  const ws = xs.map((x) => Math.exp(-(((x - x0) / bw) ** 2)));
+  const sw = ws.reduce((a, b) => a + b, 0);
+  if (sw <= 0) return median(ys);
+  const xm = ws.reduce((a, w, i) => a + w * xs[i], 0) / sw;
+  const ym = ws.reduce((a, w, i) => a + w * ys[i], 0) / sw;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < xs.length; i++) {
+    num += ws[i] * (xs[i] - xm) * (ys[i] - ym);
+    den += ws[i] * (xs[i] - xm) ** 2;
+  }
+  const slope = den > 1e-9 ? num / den : 0;
+  return ym + slope * (x0 - xm);
+}
+
+/**
+ * Per-hour LOESS median and IQR-based sigma of log(v_h / v_1) over a pool
+ * of series, evaluated at the target's log hour-1 size.
+ */
+function poolCurves(
+  pool: Map<number, number>[],
+  logP1: number,
+): { med: Map<number, number>; sd: Map<number, number> } {
   const med = new Map<number, number>();
   const sd = new Map<number, number>();
   for (let h = 2; h <= 24; h++) {
-    const ratios: number[] = [];
+    const xs: number[] = [];
+    const ys: number[] = [];
     for (const series of pool) {
       const v1 = series.get(1);
       const vh = series.get(h);
-      if (v1 !== undefined && vh !== undefined) ratios.push(Math.log(vh / v1));
+      if (v1 !== undefined && vh !== undefined) {
+        xs.push(Math.log(v1));
+        ys.push(Math.log(vh / v1));
+      }
     }
-    if (ratios.length === 0) continue;
-    ratios.sort((a, b) => a - b);
-    med.set(h, median(ratios));
-    sd.set(h, Math.max(0.05, (quantile(ratios, 0.75) - quantile(ratios, 0.25)) / 1.349));
+    if (xs.length < 4) continue;
+    const fit = loessPredict(xs, ys, logP1, LOESS_BW);
+    med.set(h, Math.max(MED_MIN, Math.min(MED_MAX, fit)));
+    // Residuals around the fit at each launch's own size, kernel-weighted
+    // toward the target's size: their spread is the honest uncertainty.
+    const res: number[] = [];
+    const resW: number[] = [];
+    for (let i = 0; i < xs.length; i++) {
+      res.push(ys[i] - loessPredict(xs, ys, xs[i], LOESS_BW));
+      resW.push(Math.exp(-(((xs[i] - logP1) / LOESS_BW) ** 2)));
+    }
+    const q25 = weightedQuantile(res, resW, 0.25);
+    const q75 = weightedQuantile(res, resW, 0.75);
+    sd.set(h, Math.max(0.05, ((q75 - q25) / 1.349) * SIGMA_SCALE));
   }
   return { med, sd };
 }
@@ -180,14 +259,15 @@ function forecastCase(c: CaseFile): { hours: { hour: number; q: number[] }[] } {
   }
   p1 = Math.max(1, p1);
   const levels = Array.isArray(c.levels) && c.levels.length === 5 ? c.levels : LEVELS;
+  const logP1 = Math.log(p1);
 
   const series = (c.comparables ?? []).map(releaseDay).filter((s) => s.has(1));
   const localPool = (c.comparables ?? [])
     .filter(isMidnightLocal)
     .map(releaseDay)
     .filter((s) => s.has(1));
-  const local = poolCurves(localPool.length > 0 ? localPool : series);
-  const all = poolCurves(series);
+  const local = poolCurves(localPool.length > 0 ? localPool : series, logP1);
+  const all = poolCurves(series, logP1);
   const med = smoothCurve(blendCurves(local.med, all.med, LOCAL_WEIGHT));
   const sd = smoothCurve(blendCurves(local.sd, all.sd, LOCAL_WEIGHT));
 
