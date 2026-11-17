@@ -157,7 +157,7 @@ function blendCurves(a: Map<number, number>, b: Map<number, number>, w: number):
 }
 
 /** The five quantiles for one hour, clamped to (0, 1e9] and non-decreasing. */
-function hourQuantiles(p1: number, levels: number[], medLog: number, sdLog: number, h: number): number[] {
+function hourQuantiles(p1: number, levels: number[], medLog: number, sdLog: number): number[] {
   const qs = levels.map((tau) => {
     const z = Z[tau] ?? 0;
     return p1 * Math.exp(medLog + z * sdLog);
@@ -196,7 +196,7 @@ function forecastCase(c: CaseFile): { hours: { hour: number; q: number[] }[] } {
     const s = sd.get(hour);
     const q =
       m !== undefined && s !== undefined
-        ? hourQuantiles(p1, levels, m, s, hour)
+        ? hourQuantiles(p1, levels, m, s)
         : levels.map((tau) => {
             const z = Z[tau] ?? 0;
             const v = Math.min(1e9, Math.max(1, p1 * Math.exp(z * FALLBACK_SIGMA * Math.sqrt(hour - 1))));
